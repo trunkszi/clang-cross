@@ -2,31 +2,228 @@
 
 set -e
 
-CT_URL="https://github.com/cross-tools"
-CT_VER=20250929
-LLVM_TARGETS="AArch64;ARM;LoongArch;Mips;PowerPC;RISCV;SystemZ;X86"
+# Disable color output to avoid ANSI escape sequences interfering with script execution
+# These environment variables affect the output of grep, ls and other commands
+export GREP_OPTIONS=
+export GREP_COLORS=
+unset GREP_OPTIONS
+unset GREP_COLORS
+# Ensure grep does not use color
+alias grep='grep --color=never' 2>/dev/null || true
+# Disable color output for ls
+unalias ls 2>/dev/null || true
 
-install_packages() {
-	sudo apt-get update
-	sudo apt-get install -y --no-install-recommends \
-		build-essential \
-		ca-certificates \
-		cmake \
-		git \
-		libz-dev \
-		ninja-build \
-		python3 \
-		wget \
-		xz-utils
+# Script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Check if sudo is needed (usually runs as root in Docker containers)
+SUDO_CMD=""
+if [ "$(id -u)" -ne 0 ]; then
+    SUDO_CMD="sudo"
+fi
+
+# Parse arguments
+TARGET=$1
+SKIP_DEPS=false
+
+if [ -z "$TARGET" ]; then
+    echo "Error: Missing target architecture parameter"
+    echo "Usage: $0 <target|llvm> [--skip-deps]"
+    echo "Examples:"
+    echo "  $0 llvm                          # Build LLVM only"
+    echo "  $0 x86_64-unknown-linux-musl     # Build target toolchain"
+    exit 1
+fi
+
+if [ "$2" == "--skip-deps" ]; then
+    SKIP_DEPS=true
+fi
+
+# System detection function
+detect_system() {
+    local system="unknown"
+
+    # Check /etc/os-release first
+    if [ -f /etc/os-release ]; then
+        # shellcheck source=/dev/null
+        source /etc/os-release
+        case "$ID" in
+            # Ubuntu - use version-specific configuration
+            ubuntu)
+                if [ "${VERSION_ID}" = "22.04" ]; then
+                    system="ubuntu22"
+                else
+                    # Other versions fall back to generic debian configuration
+                    system="debian"
+                fi
+                ;;
+            debian|linuxmint)
+                system="debian"
+                ;;
+            # Alibaba Cloud Linux 3 - use dedicated configuration
+            alinux)
+                if [ "${VERSION_ID}" = "3" ]; then
+                    system="alinux3"
+                else
+                    # Other versions fall back to generic rhel configuration
+                    system="rhel"
+                fi
+                ;;
+            # Amazon Linux - use dedicated configuration
+            amzn)
+                if [ "${VERSION_ID}" = "2" ]; then
+                    system="amazonlinux2"
+                elif [ "${VERSION_ID}" = "2023" ]; then
+                    system="amazonlinux2023"
+                else
+                    # Other versions fall back to generic rhel configuration
+                    system="rhel"
+                fi
+                ;;
+            # CentOS - use version-specific configuration
+            centos)
+                if [ "${VERSION_ID}" = "7" ]; then
+                    system="centos7"
+                else
+                    # Other versions fall back to generic rhel configuration
+                    system="rhel"
+                fi
+                ;;
+            # Other RHEL-based distributions use generic configuration
+            rhel|fedora|rocky|almalinux)
+                system="rhel"
+                ;;
+            arch|manjaro)
+                system="arch"
+                ;;
+            alpine)
+                system="alpine"
+                ;;
+            *)
+                # Check ID_LIKE
+                if [ -n "${ID_LIKE:-}" ]; then
+                    case "$ID_LIKE" in
+                        *rhel*|*fedora*|*centos*)
+                            system="rhel"
+                            ;;
+                        *debian*|*ubuntu*)
+                            system="debian"
+                            ;;
+                        *arch*)
+                            system="arch"
+                            ;;
+                    esac
+                fi
+                ;;
+        esac
+    # Fall back to detecting package manager
+    elif command -v apt-get &> /dev/null; then
+        system="debian"
+    elif command -v dnf &> /dev/null || command -v yum &> /dev/null; then
+        system="rhel"
+    elif command -v pacman &> /dev/null; then
+        system="arch"
+    elif command -v apk &> /dev/null; then
+        system="alpine"
+    fi
+
+    echo "$system"
 }
 
+# Dependency installation function
+install_dependencies() {
+    local system
+    system=$(detect_system)
+
+    if [ "$system" == "unknown" ]; then
+        echo "Error: Unable to detect operating system type"
+        echo "Please manually install dependencies or use --skip-deps parameter to skip dependency installation"
+        exit 1
+    fi
+
+    local config_file="${SCRIPT_DIR}/packages/${system}.conf"
+
+    if [ ! -f "$config_file" ]; then
+        echo "Error: Unsupported system '$system'"
+        echo "Configuration file not found: $config_file"
+        echo "Supported systems: debian, ubuntu22, rhel, amazonlinux2, alinux3, centos7, arch, alpine"
+        echo "Hint: If you are using a RHEL-based distribution, the generic rhel configuration may be used"
+        exit 1
+    fi
+
+    echo "=========================================="
+    echo "Detected operating system: $system"
+    echo "Configuration file: $config_file"
+    echo "=========================================="
+
+    # Load configuration file
+    # shellcheck source=/dev/null
+    source "$config_file"
+
+    # Execute mirror setup commands (if defined)
+    if [ ${#MIRROR_SETUP_COMMANDS[@]} -gt 0 ]; then
+        echo "Configuring package mirrors..."
+        for cmd in "${MIRROR_SETUP_COMMANDS[@]}"; do
+            eval "$cmd"
+        done
+    fi
+
+    # Update package manager
+    echo "Updating package manager..."
+    eval "$PKG_UPDATE_CMD"
+
+    # Install packages
+    echo "Installing dependencies (${#PACKAGES[@]} packages)..."
+    eval "$PKG_INSTALL_CMD ${PACKAGES[*]}"
+
+    # Execute additional setup commands
+    if [ ${#EXTRA_SETUP_COMMANDS[@]} -gt 0 ]; then
+        echo "Executing system-specific configuration..."
+        for cmd in "${EXTRA_SETUP_COMMANDS[@]}"; do
+            eval "$cmd"
+        done
+    fi
+
+    echo "=========================================="
+    echo "Dependency installation completed"
+    echo "=========================================="
+}
+
+# Install dependencies
+if [ "$SKIP_DEPS" == false ]; then
+    install_dependencies
+else
+    echo "Skipping dependency installation (--skip-deps)"
+fi
+
+# Constants
+# GitHub organization and release version (aligned with toolchain-precompiled.sh)
+GITHUB_ORG="Central-Limit-Trading"
+RELEASE_VERSION="v0.0.1"
+CT_URL="https://github.com/${GITHUB_ORG}"
+CT_VER="${RELEASE_VERSION}"
+LLVM_TARGETS="AArch64;ARM;LoongArch;Mips;PowerPC;RISCV;SystemZ;X86"
+
+# Function: Build LLVM
 build_llvm() {
-	sudo mkdir -p /opt
-	sudo chmod 0777 /opt
+	echo "=========================================="
+	echo "Building LLVM/Clang..."
+	echo "=========================================="
+
+	# Create build directory
+	${SUDO_CMD} mkdir -p /opt
+	${SUDO_CMD} chmod 0777 /opt
+
+	# Clean old build directory to avoid CMake cache issues
+	rm -rf build-llvm
 	mkdir -p build-llvm
+
 	pushd build-llvm
+
+	# Configure LLVM
 	cmake -G Ninja -S ../llvm/llvm \
-		-DLLVM_ENABLE_PROJECTS="clang;lld" \
+		-DLLVM_ENABLE_PROJECTS="clang;lld;openmp" \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_INSTALL_PREFIX=/opt/clang-cross \
 		-DCLANG_DEFAULT_LINKER=lld \
@@ -37,40 +234,132 @@ build_llvm() {
 		-DLLVM_ENABLE_ZLIB=ON \
 		-DLLVM_LINK_LLVM_DYLIB=ON \
 		-DLLVM_TARGETS_TO_BUILD="${LLVM_TARGETS}" \
-		-DLLVM_INSTALL_TOOLCHAIN_ONLY=ON
-	ninja install/strip
+		-DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
+		-DLLVM_INCLUDE_TESTS=OFF \
+		-DLIBOMP_USE_QUAD_PRECISION=OFF
+
+	# Build and install
+	ninja install
+
+	# Strip binaries to reduce size
+	find /opt/clang-cross/bin -type f -executable -exec strip --strip-unneeded {} \; 2>/dev/null || true
+
 	popd
 	rm -rf build-llvm
-	sudo mv /opt/clang-cross .
-	sudo chown -R root:root clang-cross
-	sudo tar -cJvf clang-cross.tar.xz clang-cross
+
+	# Package LLVM
+	# Remove old clang-cross directory if it exists
+	rm -rf clang-cross
+	${SUDO_CMD} mv /opt/clang-cross .
+	${SUDO_CMD} chown -R root:root clang-cross
+	${SUDO_CMD} tar -cJvf clang-cross.tar.xz clang-cross
+
+	echo "=========================================="
+	echo "LLVM build completed: clang-cross.tar.xz"
+	echo "=========================================="
 }
 
-build_target() {
-	TARGET=${1}
-	. targets/${TARGET}/config
-	sudo tar -xf clang-cross.tar.xz -C /opt
-	sudo chown -R $(id -u):$(id -g) /opt/clang-cross
-	case ${TARGET} in
-		*gnu*)
-			URL="${CT_URL}/gnu-cross/releases/download/${CT_VER}/${TARGET}.tar.xz"
-			;;
-		*musl*)
-			URL="${CT_URL}/musl-cross/releases/download/${CT_VER}/${TARGET}.tar.xz"
-			;;
-	esac
-	for n in {0..9}; do
-		if wget -O - "${URL}" | tar xJ; then
-			break
+# Function: Download toolchain
+download_toolchain() {
+	local url="$1"
+	local target="$2"
+
+	echo "=========================================="
+	echo "Downloading toolchain for: ${target}"
+	echo "URL: ${url}"
+	echo "=========================================="
+
+	# Try to download with retry (3 attempts)
+	for n in {0..2}; do
+		if wget -O - "${url}" | tar xJ; then
+			echo "=========================================="
+			echo "Successfully downloaded toolchain"
+			echo "=========================================="
+			return 0
 		fi
+		echo "Download failed, retrying in 5 seconds... (attempt $((n+1))/3)"
 		sleep 5
 	done
+
+	echo "=========================================="
+	echo "Error: Failed to download toolchain after 3 attempts"
+	echo "URL: ${url}"
+	echo "=========================================="
+	return 1
+}
+
+# Function: Build target toolchain
+build_target() {
+	TARGET=${1}
+
+	echo "=========================================="
+	echo "Building target toolchain: ${TARGET}"
+	echo "=========================================="
+
+	# Load target configuration
+	if [ ! -f "targets/${TARGET}/config" ]; then
+		echo "Error: Target configuration not found: targets/${TARGET}/config"
+		exit 1
+	fi
+	. targets/${TARGET}/config
+
+	# Extract LLVM
+	${SUDO_CMD} tar -xf clang-cross.tar.xz -C /opt
+	${SUDO_CMD} chown -R $(id -u):$(id -g) /opt/clang-cross
+
+	# Detect system for system-specific toolchain download
+	SYSTEM=$(detect_system)
+	echo "Detected system: ${SYSTEM}"
+
+	# Define systems that have precompiled system-specific toolchains
+	SUPPORTED_SYSTEMS="ubuntu22 centos7 alinux3 amazonlinux2"
+
+	# Determine repository based on target type
+	case ${TARGET} in
+		*gnu*)
+			REPO="gnu-cross"
+			;;
+		*musl*)
+			REPO="musl-cross"
+			;;
+		*)
+			echo "Error: Unknown target type: ${TARGET}"
+			exit 1
+			;;
+	esac
+
+	# Generate download URL
+	if [[ " ${SUPPORTED_SYSTEMS} " =~ " ${SYSTEM} " ]]; then
+		# System-specific toolchain is available
+		DOWNLOAD_URL="${CT_URL}/${REPO}/releases/download/${CT_VER}/${TARGET}-${SYSTEM}.tar.xz"
+		echo "Using system-specific toolchain for: ${SYSTEM}"
+	else
+		# Use generic toolchain for unsupported systems
+		DOWNLOAD_URL="${CT_URL}/${REPO}/releases/download/${CT_VER}/${TARGET}.tar.xz"
+		echo "Using generic toolchain for system: ${SYSTEM}"
+	fi
+
+	# Download prebuilt toolchain
+	if ! download_toolchain "${DOWNLOAD_URL}" "${TARGET}"; then
+		exit 1
+	fi
+
+	if [ ! -d "${TARGET}" ]; then
+		echo "Error: Toolchain directory not found after download: ${TARGET}"
+		exit 1
+	fi
+
+	# Extract necessary files
 	find ${TARGET} -exec chmod +w {} \;
 	cp -a ${TARGET}/include /opt/clang-cross/
 	cp -a ${TARGET}/lib/gcc /opt/clang-cross/lib/
 	cp -a ${TARGET}/${TARGET} /opt/clang-cross/
+
+	# Clean up unnecessary files
 	rm -rf /opt/clang-cross/lib/gcc/${TARGET}/*/{install-tools,plugin}
 	rm -rf /opt/clang-cross/${TARGET}/{bin,debug-root,lib}
+
+	# Create compiler wrapper scripts
 	for n in clang:clang clang++:clang++ cpp:clang-cpp; do
 		cat > /opt/clang-cross/bin/${TARGET}-${n%%:*} <<-EOF
 			#!/bin/sh
@@ -82,8 +371,12 @@ build_target() {
 		EOF
 		chmod +x /opt/clang-cross/bin/${TARGET}-${n%%:*}
 	done
+
+	# Create symbolic links
 	ln -sf ${TARGET}-clang /opt/clang-cross/bin/${TARGET}-cc
 	ln -sf ${TARGET}-clang++ /opt/clang-cross/bin/${TARGET}-c++
+
+	# Create LLVM tool wrapper scripts
 	for n in ar:ar c++filt:cxxfilt nm:nm objcopy:objcopy objdump:objdump ranlib:ranlib size:size strings:strings strip:strip; do
 		cat > /opt/clang-cross/bin/${TARGET}-${n%%:*} <<-EOF
 			#!/bin/sh
@@ -94,22 +387,39 @@ build_target() {
 		EOF
 		chmod +x /opt/clang-cross/bin/${TARGET}-${n%%:*}
 	done
+
+	# Set read-only permissions
 	find /opt/clang-cross -exec chmod -w {} \;
+
+	# Clean up temporary files
 	rm -rf ${TARGET}
-	sudo mv /opt/clang-cross ${TARGET}
-	sudo chown -R root:root ${TARGET}
-	sudo tar -cJvf ${TARGET}.tar.xz ${TARGET}
-	sudo sha256sum ${TARGET}.tar.xz | awk '{ print $1 }' > ${TARGET}.tar.xz.sha256
+
+	# Package
+	${SUDO_CMD} mv /opt/clang-cross ${TARGET}
+	${SUDO_CMD} chown -R root:root ${TARGET}
+	${SUDO_CMD} tar -cJvf ${TARGET}.tar.xz ${TARGET}
+	${SUDO_CMD} sha256sum ${TARGET}.tar.xz | awk '{ print $1 }' > ${TARGET}.tar.xz.sha256
+
+	echo "=========================================="
+	echo "Target toolchain build completed!"
+	echo "=========================================="
+	echo "Output files:"
+	echo "  - ${TARGET}.tar.xz"
+	echo "  - ${TARGET}.tar.xz.sha256"
+	echo ""
+	echo "SHA256: $(cat ${TARGET}.tar.xz.sha256)"
+	echo "=========================================="
 }
 
-install_packages
-
+# Main build logic
 if [ ! -e clang-cross.tar.xz ]; then
 	build_llvm
 fi
 
-if [ "${1}" != "llvm" ]; then
-	build_target ${1}
+if [ "${TARGET}" != "llvm" ]; then
+	build_target ${TARGET}
 fi
 
 # vim: set ts=4 sw=4 noexpandtab:
+
+
