@@ -1,0 +1,264 @@
+name: Release
+
+on:
+  schedule:
+    - cron: '40 3 * * *'
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: Target triples (comma-separated)
+        default: 'x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl'
+        type: string
+      containers:
+        description: Host labels (comma-separated, or all)
+        default: 'all'
+        type: string
+      create_release:
+        description: Publish the complete verified matrix
+        default: false
+        type: boolean
+      release_tag:
+        description: Mutable release tag
+        default: 'v0.0.1'
+        type: string
+      source_run_id:
+        description: Successful release-workflow run whose artifacts should be reused
+        default: ''
+        type: string
+      check_upstream:
+        description: Discover and preflight the latest p2996 commit
+        default: false
+        type: boolean
+      llvm_seed_run_id:
+        description: Recover host LLVM from successful musl artifacts in this completed run
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: clang-cross-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.prepare.outputs.matrix }}
+      should_build: ${{ steps.prepare.outputs.should_build }}
+      upstream_updated: ${{ steps.prepare.outputs.upstream_updated }}
+      full_matrix: ${{ steps.prepare.outputs.full_matrix }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - name: Validate local contracts
+        run: bash tests/run.sh
+      - name: Resolve upstream and prepare matrix
+        id: prepare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGETS_INPUT: ${{ inputs.targets }}
+          CONTAINERS_INPUT: ${{ inputs.containers }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          CHECK_UPSTREAM: ${{ inputs.check_upstream || 'false' }}
+        run: ./scripts/prepare-matrix.sh
+      - name: Preserve candidate identity
+        if: inputs.source_run_id == '' && steps.prepare.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: candidate-source
+          path: candidate/
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    needs: prepare-matrix
+    if: needs.prepare-matrix.outputs.should_build == 'true' && inputs.source_run_id == ''
+    runs-on: ubuntu-22.04
+    timeout-minutes: 1440
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: candidate-source
+          path: candidate/
+      - name: Apply the exact preflighted source
+        run: |
+          set -euo pipefail
+          cp candidate/targets/versions targets/versions
+          cp candidate/targets/x86_64-unknown-linux-musl/patches/README.md targets/x86_64-unknown-linux-musl/patches/README.md
+          source targets/versions
+          git -C llvm fetch --depth=1 origin "$LLVM_SOURCE_REVISION"
+          git -C llvm checkout --detach "$LLVM_SOURCE_REVISION"
+          bash tests/test_config_and_patches.sh
+      - name: Resolve host image identity
+        id: image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_IMAGE: ${{ matrix.container.image }}
+          BUILD_OS: ${{ matrix.container.label }}
+          LLVM_SEED_RUN_ID: ${{ inputs.llvm_seed_run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$LLVM_SEED_RUN_ID" ]]; then
+            digest=$(python3 scripts/seed-llvm.py --run-id "$LLVM_SEED_RUN_ID" --host "$BUILD_OS" --image-only)
+            BUILD_IMAGE="${BUILD_IMAGE}@${digest}"
+          fi
+          docker pull "$BUILD_IMAGE"
+          printf 'reference=%s\n' "$BUILD_IMAGE" >> "$GITHUB_OUTPUT"
+          image_id=$(docker image inspect --format '{{.Id}}' "$BUILD_IMAGE")
+          printf 'digest=%s\n' "${image_id#sha256:}" >> "$GITHUB_OUTPUT"
+          repo_digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$BUILD_IMAGE")
+          printf 'manifest=%s\n' "${repo_digest##*@}" >> "$GITHUB_OUTPUT"
+      - name: Restore packaged toolchain
+        id: toolchain-cache
+        uses: actions/cache/restore@v5
+        with:
+          key: toolchain-v1-${{ matrix.target }}-${{ matrix.container.label }}-${{ steps.image.outputs.digest }}-${{ hashFiles('scripts/make', 'scripts/dependencies.sh', 'scripts/build-with-docker.sh', 'scripts/download-toolchain.sh', 'scripts/check-archive.py', 'scripts/seed-llvm.py', 'scripts/packages/**', 'targets/**') }}
+          path: |
+            ${{ matrix.target }}.tar.xz
+            ${{ matrix.target }}.tar.xz.sha256
+      - name: Restore host LLVM
+        id: llvm-cache
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v5
+        with:
+          key: llvm-v1-${{ matrix.container.label }}-${{ steps.image.outputs.digest }}-${{ hashFiles('scripts/make', 'scripts/dependencies.sh', 'scripts/build-with-docker.sh', 'scripts/seed-llvm.py', 'scripts/packages/**', 'targets/versions') }}
+          path: |
+            clang-cross-*.tar.xz
+            clang-cross-*.tar.xz.sha256
+            clang-cross-*.seed.json
+      - name: Download host LLVM seed
+        if: inputs.llvm_seed_run_id != '' && steps.toolchain-cache.outputs.cache-hit != 'true' && steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: toolchain-x86_64-unknown-linux-musl-${{ matrix.container.label }}
+          path: llvm-seed/
+          run-id: ${{ inputs.llvm_seed_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Recover matching host LLVM without compilation
+        if: inputs.llvm_seed_run_id != '' && steps.toolchain-cache.outputs.cache-hit != 'true' && steps.llvm-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLVM_SEED_RUN_ID: ${{ inputs.llvm_seed_run_id }}
+          BUILD_OS: ${{ matrix.container.label }}
+          BUILD_IMAGE_DIGEST: ${{ steps.image.outputs.manifest }}
+        run: |
+          set -euo pipefail
+          source targets/versions
+          archive="clang-cross-${LLVM_VERSION}-${LLVM_SOURCE_REVISION:0:12}-${BUILD_OS}.tar.xz"
+          python3 scripts/seed-llvm.py --run-id "$LLVM_SEED_RUN_ID" --host "$BUILD_OS" \
+            --image-digest "$BUILD_IMAGE_DIGEST" --directory llvm-seed --output "$archive"
+      - name: Build and verify installed toolchain
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_IMAGE: ${{ steps.image.outputs.reference }}
+          BUILD_OS: ${{ matrix.container.label }}
+          REUSE_PACKAGED_TOOLCHAIN: ${{ steps.toolchain-cache.outputs.cache-hit || 'false' }}
+        run: ./scripts/build-with-docker.sh "$BUILD_TARGET" "$BUILD_IMAGE" "$BUILD_OS"
+      - name: Save host LLVM even if later verification failed
+        if: ${{ always() && steps.llvm-cache.outputs.cache-hit != 'true' && hashFiles('clang-cross-*.tar.xz.sha256') != '' }}
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ steps.llvm-cache.outputs.cache-primary-key }}
+          path: |
+            clang-cross-*.tar.xz
+            clang-cross-*.tar.xz.sha256
+            clang-cross-*.seed.json
+      - name: Save packaged toolchain even if verification failed
+        if: ${{ always() && steps.toolchain-cache.outputs.cache-hit != 'true' && hashFiles(format('{0}.tar.xz.sha256', matrix.target)) != '' }}
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ steps.toolchain-cache.outputs.cache-primary-key }}
+          path: |
+            ${{ matrix.target }}.tar.xz
+            ${{ matrix.target }}.tar.xz.sha256
+      - name: Record artifact identity
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_OS: ${{ matrix.container.label }}
+        run: python3 scripts/release.py receipt --directory . --target "$BUILD_TARGET" --host "$BUILD_OS"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: toolchain-${{ matrix.target }}-${{ matrix.container.label }}
+          path: |
+            ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz
+            ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz.sha256
+            ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz.provenance.json
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [prepare-matrix, build]
+    if: >-
+      always() && needs.prepare-matrix.result == 'success' &&
+      needs.prepare-matrix.outputs.full_matrix == 'true' &&
+      (needs.build.result == 'success' || (inputs.source_run_id != '' && needs.build.result == 'skipped')) &&
+      (github.event_name == 'schedule' || inputs.create_release == true)
+    permissions:
+      contents: write
+      actions: read
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      UPSTREAM_UPDATED: ${{ needs.prepare-matrix.outputs.upstream_updated }}
+      TAG: ${{ inputs.release_tag || 'v0.0.1' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Resolve artifact source
+        run: python3 scripts/release.py resolve --run-id "$SOURCE_RUN_ID"
+      - name: Load source run tree
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "$ARTIFACT_SHA"
+          git checkout --detach "$ARTIFACT_SHA"
+      - name: Download candidate identity
+        uses: actions/download-artifact@v8
+        with:
+          name: candidate-source
+          path: candidate/
+          run-id: ${{ inputs.source_run_id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download complete matrix
+        uses: actions/download-artifact@v8
+        with:
+          path: release/
+          pattern: toolchain-*
+          merge-multiple: true
+          run-id: ${{ inputs.source_run_id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify and publish assets before moving refs
+        run: python3 scripts/release.py publish --directory release --candidate candidate --tag "$TAG"
+
+  notify-failure:
+    needs: [prepare-matrix, build, release]
+    if: always() && (needs.prepare-matrix.result == 'failure' || needs.build.result == 'failure' || needs.release.result == 'failure')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Failure summary and optional SMTP notification
+        env:
+          PREPARE_RESULT: ${{ needs.prepare-matrix.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+        run: python3 scripts/notify-failure.py

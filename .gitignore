@@ -1,0 +1,10 @@
+/build-*/
+/*.tar.xz
+/*.tar.xz.sha256
+/x86_64-unknown-linux-gnu/
+/x86_64-unknown-linux-musl/
+__pycache__/
+/.build.lock
+/candidate/
+/llvm-seed/
+/*.seed.json
