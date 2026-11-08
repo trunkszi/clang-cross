@@ -1,0 +1,42 @@
+# shellcheck source=targets/versions
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/versions"
+
+CLANG_ARGS=""
+
+# compiler-rt and C++ runtimes for x86_64-unknown-linux-gnu (glibc).
+CRT_ENABLE_RUNTIMES="compiler-rt;libunwind;libcxx;libcxxabi"
+CRT_RUNTIME_ARCH=x86_64
+CRT_BUILD_BUILTINS=ON
+CRT_BUILD_SANITIZERS=ON
+CRT_BUILD_PROFILE=ON
+CRT_BUILD_MEMPROF=ON
+CRT_BUILD_LIBFUZZER=ON
+CRT_BUILD_GWP_ASAN=ON
+CRT_BUILD_XRAY=ON
+CRT_REQUIRED_RUNTIMES="
+builtins
+asan
+asan_cxx
+asan_static
+asan_preinit
+lsan
+ubsan_minimal
+ubsan_standalone
+ubsan_standalone_cxx
+tsan
+tsan_cxx
+msan
+msan_cxx
+dfsan
+profile
+fuzzer
+fuzzer_no_main
+fuzzer_interceptors
+memprof
+memprof_cxx
+gwp_asan
+xray
+xray_basic
+xray_fdr
+xray_profiling
+"

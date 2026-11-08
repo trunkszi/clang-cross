@@ -1,0 +1,61 @@
+# shellcheck source=targets/versions
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/versions"
+
+CLANG_ARGS=""
+EXPECTED_BASE_GCC_VERSION=${EXPECTED_BASE_GCC_VERSION:-16.1.0}
+EXPECTED_MUSL_VERSION=1.2.6
+EXPECTED_MUSL_LOADER=ld-musl-x86_64.so.1
+
+# LLVM runtimes for x86_64-unknown-linux-musl.
+#
+# The Alpine patches under targets/x86_64-unknown-linux-musl/patches/ are
+# applied by build_compiler_rt before the build. This follows Alpine's
+# main/llvm-runtimes layout for LLVM 21.0.0 (bloomberg/clang-p2996): compiler-rt plus the C++
+# runtimes needed by practical sanitizer use on musl.
+#
+# CRT_MUSL_PREINIT_OFF -> compiler-rt built with
+#   -DSANITIZER_CAN_USE_PREINIT_ARRAY=0 (musl .preinit_array semantics).
+CRT_ENABLE_RUNTIMES="compiler-rt;libunwind;libcxx;libcxxabi"
+CRT_RUNTIME_ARCH=x86_64
+CRT_MUSL_PREINIT_OFF=1
+CRT_BUILD_BUILTINS=ON
+CRT_BUILD_SANITIZERS=ON
+CRT_BUILD_PROFILE=ON
+CRT_BUILD_MEMPROF=ON
+CRT_BUILD_LIBFUZZER=ON
+CRT_BUILD_GWP_ASAN=OFF
+# XRay on musl: COMPILER_RT_HAS_XRAY only gates on OS_NAME ("Linux") not libc,
+# XRay source uses POSIX pthread only (no SANITIZER_GLIBC guards needed), and
+# the SANITIZER_CAN_USE_PREINIT_ARRAY=0 path (forced via CRT_MUSL_PREINIT_OFF)
+# falls back to __attribute__((constructor(0))) — musl-safe out of the box.
+CRT_BUILD_XRAY=ON
+CRT_LIBCXX_HAS_MUSL_LIBC=ON
+CRT_LIBUNWIND_HAS_NODEFAULTLIBS_FLAG=OFF
+# Intentionally no CRT_SANITIZERS_TO_BUILD: build the full compiler-rt set,
+# then validate the expected x86_64 sanitizer/runtime artifacts below.
+CRT_REQUIRED_RUNTIMES="
+builtins
+asan
+asan_cxx
+asan_static
+asan_preinit
+lsan
+ubsan_minimal
+ubsan_standalone
+ubsan_standalone_cxx
+tsan
+tsan_cxx
+msan
+msan_cxx
+dfsan
+profile
+fuzzer
+fuzzer_no_main
+fuzzer_interceptors
+memprof
+memprof_cxx
+xray
+xray_basic
+xray_fdr
+xray_profiling
+"
